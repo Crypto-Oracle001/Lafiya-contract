@@ -20,3 +20,14 @@ export {
   type RetryOptions,
   type StreamOptions,
 } from "./stream.js";
+export {
+  decodeIncentivePoolEvent,
+  IncentivePoolDecodeError,
+  incentivePoolEventKindOf,
+  incentivePoolEventSpecs,
+  isIncentivePoolEvent,
+  type IncentivePoolEvent,
+  type IncentivePoolEventKind,
+  type IncentivePoolEventMeta,
+  type IncentivePoolRawEvent,
+} from "./incentive-pool.js";

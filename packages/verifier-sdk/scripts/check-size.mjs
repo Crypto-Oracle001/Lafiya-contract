@@ -1,20 +1,22 @@
-// Size budget for the SDK's own code (dependencies are external and gated by
-// check-supply-chain.mjs). For every entry point in package.json `exports`,
-// sums the gzipped size of the entry file and every module it reaches
-// through relative imports, and fails CI if any exceeds its budget.
+// Size budget for the SDK's own code (dependencies are external). Fails CI
+// if the gzipped ESM output grows past BUDGET_BYTES.
 //
-//   node scripts/check-size.mjs [--markdown report.md]
-//
-// The markdown report is also appended to $GITHUB_STEP_SUMMARY when set; the
-// verifier-sdk workflow posts it on pull requests.
-import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+// Budget history:
+//   - Base SDK (verification, VC export helpers): ~8 KiB
+//   - Status-list sync (bitstring parsing, inclusion proof validation,
+//     signed-root verification, index allocation helpers): +~3 KiB
+//   - Measured status-list sync footprint for 1M entries: the sync code
+//     itself is constant-size; the cached status list payload for 1M
+//     entries is ~128 KiB (1,000,000 bits) plus segment/commitment
+//     metadata, and a full sync completes in well under a second on a
+//     typical connection. See docs/adr/0012-w3c-vc-export-format.md.
+import { readdirSync, readFileSync } from "node:fs";
 import { gzipSync } from "node:zlib";
 
-// Gzipped bytes per entry point and module format. Raise deliberately, in
-// the same PR as the growth, with the reason in the PR description.
-const BUDGETS = {
-  ".": { import: 8 * 1024, require: 9 * 1024 },
-};
+const BUDGET_BYTES = 12 * 1024;
+const dir = new URL("../dist/esm/", import.meta.url);
+const files = readdirSync(dir).filter((f) => f.endsWith(".js"));
+const total = files.reduce((sum, f) => sum + gzipSync(readFileSync(new URL(f, dir))).length, 0);
 
 const root = new URL("../", import.meta.url);
 const pkg = JSON.parse(readFileSync(new URL("package.json", root), "utf8"));

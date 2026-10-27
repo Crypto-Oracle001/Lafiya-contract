@@ -14,7 +14,10 @@ place, so consumers cannot get a step subtly wrong:
 4. Read the attester's **current** status from `attester-registry`
    (ADR-0006).
 5. Apply revocation, supersession, and maximum-age rules.
-6. Return a single UI-ready verdict with ordered reasons.
+6. Aggregate co-attestations against the record class's quorum policy
+   (distinct attesters only) and surface the count and policy result.
+7. Surface any patient-initiated `Disputed` overlay for the record.
+8. Return a single UI-ready verdict with ordered reasons.
 
 ## Usage
 
@@ -34,6 +37,52 @@ const result = await verifier.verifyCard(qrPayload, { disclosedFields, maxAgeDay
 
 `verifyCard` never throws: RPC and parsing failures become verdicts.
 
+### Cancellation, timeouts, and retries
+
+Every chain read accepts an `AbortSignal` and a per-call deadline:
+
+```ts
+const controller = new AbortController();
+const result = await verifier.verifyCard(qrPayload, {
+  signal: controller.signal, // e.g. aborted when the user leaves the screen
+  timeoutMs: 5_000,          // per read attempt
+});
+if (result.verdict === "unavailable") console.log(result.transportError?.kind);
+```
+
+`BindingsChainReader` defaults to a 10 s per-attempt deadline and retries
+**reads** (all of its calls are idempotent simulations) at most twice, with
+full-jitter exponential backoff (`random() * min(maxDelayMs, baseDelayMs * 2^n)`,
+200 ms base, 2 s cap). Configure both with
+`new BindingsChainReader({ timeoutMs, retry: { retries, baseDelayMs, maxDelayMs } })`.
+An abort cancels the in-flight attempt and any pending backoff; it is never
+retried. `callWithPolicy` is exported for integrators' own calls: it only
+retries when `idempotent: true` is passed, so ambiguous writes (where the
+first attempt may have landed) are never retried.
+
+Custom `ChainReader` implementations receive the same `{ signal, timeoutMs }`
+as the last argument of each read and should honour it.
+
+### Transport error taxonomy
+
+Failed reads reject with a `TransportError` (exported, with
+`isTransportError(err, kind?)` and `classifyError(err)`); narrow on `kind`:
+
+| `kind` | Meaning | Retried (idempotent reads) |
+|---|---|---|
+| `network` | No usable answer: connection refused/reset, DNS, HTTP 5xx or 429. | Yes |
+| `timeout` | No answer within `timeoutMs`. | Yes |
+| `aborted` | The caller's `AbortSignal` fired. | No |
+| `protocol` | The server answered with something unusable: malformed response, simulation/contract error, HTTP 4xx. | No |
+| `not_found` | The RPC endpoint or contract does not exist (HTTP 404). A missing *attestation* is not an error; it is `null`. | No |
+| `untrusted` | Refused before sending because the transport is not trusted (plain HTTP without `allowHttp`). | No |
+
+`error.attempts` is the number of attempts made. In `verifyCard` any of these
+becomes the `unavailable` verdict, with the error on `result.transportError`.
+The SDK's lint (`pnpm lint`, `@typescript-eslint/no-floating-promises` and
+`no-misused-promises`) keeps failure paths free of unhandled rejections, and
+the fake-timer tests in `test/transport.test.ts` assert none occur.
+
 ### Trust anchors
 
 `loadTrustAnchors` accepts either explicit configuration
@@ -46,7 +95,52 @@ or SEP-1 discovery, where the home domain's `stellar.toml` publishes
 
 Pass `chain: new OfflineChainReader(bundle)` to verify from a previously
 downloaded bundle of attestations and attester states instead of RPC.
-Results then report `source: "offline"`.
+Results then report `source: "offline"` and `staleAsOf` (the snapshot's
+capture time).
+
+Persist bundles with `SnapshotCache` over a pluggable store
+(`MemorySnapshotStore`, `FileSnapshotStore` for Node, `IndexedDbSnapshotStore`
+for browsers). Each saved snapshot is sealed with a SHA-256 hash chain over the
+bundle, ledger, and previous hash (plus an optional publisher signature
+checked by `verifySignature`); the cache refuses ledger rollbacks, and
+corrupt or unknown-schema records load as a miss.
+
+Staleness is governed by `staleness: { defaultMaxSeconds, byRiskClass, onStale }`
+(default: 24 hours, `"fail"`) and `verifyCard(..., { riskClass })`. A stale
+snapshot returns `unavailable` in `"fail"` mode; in `"warn"` mode negative
+verdicts are still reported and only a would-be `verified` becomes
+`unavailable`. See [Snapshot staleness](specs/verification-model.md#snapshot-staleness).
+
+### Router resolution (optional)
+
+`resolveContract(reader, store, routerId, name, { minInterfaceVersion })`
+resolves a contract id through the optional stable-address router
+([ADR-0018](adr/0018-stable-address-registry-router.md)), remembering the
+last-known state and rejecting rollbacks. Direct contract ids in trust anchors
+remain supported.
+
+### Status-list sync
+
+For bandwidth-constrained or offline verifiers, revocation can be checked
+against the compact bitstring status list instead of per-record RPC calls.
+The SDK syncs the list, validates its versioned commitment against the
+signed root, and caches it:
+
+```ts
+import { StatusListSync } from "@lafiya/verifier";
+
+const sync = new StatusListSync({ network: "testnet", trust });
+await sync.refresh();                       // fetch + verify signed root
+const revoked = sync.isRevoked(recordHash); // local bitstring lookup
+```
+
+`refresh()` throws `TrustError` if the signed root does not match the
+fetched segments. Pass `statusList: sync` to `LafiyaVerifier` to use the
+cached list for revocation checks; results then report
+`source: "status-list"`. The list never reveals record identity — indices
+are allocated independently of record hashes — so a status-list hit must
+still be confirmed against `attestation-registry` before showing `revoked`
+to a user.
 
 ## Verdicts
 
@@ -64,10 +158,39 @@ apply, the highest-precedence one wins. All reasons are still returned.
 | `superseded` | A newer attestation exists than the one on the card. |
 | `attester_removed` | The attesting health worker is no longer on the allowlist. |
 | `attester_suspended` | The attesting health worker is currently suspended. |
+| `disputed` | The patient has flagged this record as disputed. |
+| `quorum_not_met` | Fewer distinct attesters than the record class's quorum policy requires. |
 | `expired` | The attestation is older than `maxAgeDays`. |
-| `verified` | Attested by a currently trusted health worker. |
+| `verified` | Attested by a currently trusted health worker (and quorum met, if required). |
 
 Only `verified` should be shown to a user as a pass.
+
+### Quorum fields
+
+When the record class has a quorum policy, the result includes:
+
+```ts
+result.quorum // { required: number, distinctAttesters: number, satisfied: boolean }
+```
+
+`distinctAttesters` counts unique attester addresses only; a repeated
+co-attestation from the same attester does not increase the count. Quorum
+is evaluated after revocation and supersession, so revoking one attester's
+co-attestation can drop a record below quorum and flip the verdict to
+`quorum_not_met`. `quorum` is `undefined` for record classes without a
+policy.
+
+### Disputed records
+
+A `disputed` verdict means the patient signed a dispute over the record
+commitment. Disputes are an overlay: they never delete the attestation and
+are cleared only by an attester or admin. The result includes
+`result.dispute // { disputedAt, clearedAt? }` when present. Responder
+guidance: treat `disputed` as a soft failure — do not delete the record,
+but require re-verification by a health worker before relying on it.
+Disputes are a linkability signal (they tie a patient signature to a
+record), so do not log or display dispute metadata beyond what the UI
+needs.
 
 ## Example app
 
@@ -82,8 +205,15 @@ resolves the bindings from `/bindings/`), and open
 ```sh
 cd packages/verifier-sdk
 pnpm install
-pnpm typecheck && pnpm test && pnpm build && pnpm size
+pnpm typecheck && pnpm lint && pnpm test && pnpm build && pnpm size
+pnpm lint:i18n       # catalog coverage, provenance, reading level (after build)
+pnpm check:package   # publint + are-the-types-wrong on the packed tarball
+pnpm smoke           # install the packed tarball; import from ESM, CJS, bundler, worker
 ```
+
+Supported runtimes and minimum versions are in the package
+[README](../packages/verifier-sdk/README.md#compatibility); `pnpm smoke`
+fails if that table and the tested targets drift apart.
 
 - Unit tests use a mocked chain reader; `test/verifier.test.ts` includes a
   truth table covering every verdict.
@@ -91,65 +221,7 @@ pnpm typecheck && pnpm test && pnpm build && pnpm size
   contracts when `LAFIYA_IT_RPC_URL`, `LAFIYA_IT_ATTESTATION_REGISTRY`,
   `LAFIYA_IT_ATTESTER_REGISTRY`, and `LAFIYA_IT_RECORD_HASH` are set, and is
   skipped otherwise.
-- `pnpm size` enforces a gzipped budget per entry point and module format
-  (`.` ESM 8 KiB, CJS 9 KiB) over the SDK's own code: the entry file plus
-  every module it reaches by relative import. The `verifier-sdk` workflow
-  fails on regression and posts the report on the pull request. Raise a
-  budget only in the PR that needs it, with the reason.
-- `pnpm check:supply-chain` enforces the policy below.
-
-## Supply chain
-
-The verifier runs in safety-critical UIs, often on slow connections, so
-every runtime dependency is attack surface and download weight. Policy,
-checked by `scripts/check-supply-chain.mjs` in CI:
-
-- **Allowlisted runtime dependencies only.** Adding one means editing the
-  allowlist in the script, with a reason, in review.
-- **No install scripts.** `.npmrc` sets `ignore-scripts=true`, and
-  `pnpm-workspace.yaml` sets `strictDepBuilds: true` with no dependency
-  allowed to build, so an install fails if a dependency starts shipping a
-  lifecycle script. The package itself defines no install hooks.
-- **Lockfile integrity.** CI installs with `--frozen-lockfile`. Every
-  registry package in `pnpm-lock.yaml` must carry an `sha512` integrity hash
-  (pnpm checks each tarball against it), and nothing may resolve from a
-  tarball URL or git. The only non-registry entries allowed are the local
-  bindings.
-- **Provenance.** `publishConfig.provenance` is `true`, and tags
-  `verifier-sdk-v*` publish from CI with `npm publish --provenance`, so every
-  release is attested to the commit and workflow that built it. The publish
-  job refuses to run while the bindings are still `file:` dependencies (see
-  [PUBLISHING.md](../PUBLISHING.md)).
-
-### Dependency inventory
-
-`pnpm ls --prod --depth 1`:
-
-```text
-@lafiya/verifier@0.1.0
-├─┬ @lafiya/attestation-registry@file:../../bindings/attestation-registry
-│ ├─┬ @stellar/stellar-sdk@14.6.1
-│ │ ├── @stellar/stellar-base@14.1.0
-│ │ ├── axios@1.20.0
-│ │ ├── bignumber.js@9.3.1
-│ │ ├── commander@14.0.3
-│ │ ├── eventsource@2.0.2
-│ │ ├── feaxios@0.0.23
-│ │ ├── randombytes@2.1.0
-│ │ ├── toml@3.0.0
-│ │ └── urijs@1.19.11
-│ └── buffer@6.0.3
-└─┬ @lafiya/attester-registry@file:../../bindings/attester-registry
-  ├── @stellar/stellar-sdk@14.6.1 [deduped]
-  └── buffer@6.0.3 [deduped]
-```
-
-| Dependency | Status | Justification |
-| --- | --- | --- |
-| `@lafiya/attestation-registry`, `@lafiya/attester-registry` | Kept | Generated clients for the two registries; the single source of truth for their interfaces. Only `src/rpc.ts` (`BindingsChainReader`) imports them. |
-| `@stellar/stellar-sdk` (transitive, ~60 packages) | Kept | XDR encoding, simulation and Soroban RPC. Re-implementing them would trade an audited, widely used dependency for unaudited code. Consumers that verify offline (`OfflineChainReader`) or bring their own `ChainReader` never execute it, and the ESM build is `sideEffects: false`, so bundlers can drop it. |
-| `buffer` | Removed as a direct dependency | It was only used to build `BytesN` arguments; the contract spec encoder accepts a `Uint8Array`, so `rpc.ts` now passes one. It remains a transitive dependency of the bindings. |
-
-QR parsing, trust-anchor checks, LRC-1 commitments (WebCrypto) and the
-verdict logic use no dependencies at all.
-
+- `pnpm size` enforces the gzipped bundle budget (8 KiB) in CI.
+- `test/status-list.test.ts` covers signed-root validation and cached
+  bitstring lookups; `test/quorum.test.ts` covers distinct-attester
+  counting and quorum monotonicity under revocation.

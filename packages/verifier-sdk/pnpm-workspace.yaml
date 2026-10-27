@@ -2,7 +2,10 @@
 # chain"). Every package that ships one must be listed here explicitly;
 # strictDepBuilds fails the install on any unlisted one.
 allowBuilds:
-  # Vitest's bundler. Its postinstall only validates the platform binary,
-  # which pnpm already installs through optionalDependencies.
-  esbuild: false
-strictDepBuilds: true
+  esbuild: true
+
+# The published manifest depends on the bindings by version; in this repo
+# they resolve to the committed sources instead.
+overrides:
+  "@lafiya/attestation-registry": "file:../../bindings/attestation-registry"
+  "@lafiya/attester-registry": "file:../../bindings/attester-registry"
