@@ -60,6 +60,8 @@
   - [ADR-0018: Incentive pool approver quorum](adr/0018-incentive-pool-approver-quorum.md)
   - [ADR template](adr/0000-template.md)
 - [Spike: contract interface conformance](spikes/0137-contract-interface-conformance.md)
+- [Responder verdict UX guidelines](integration/verdict-ux-guidelines.md)
+- [Spike: ZK selective disclosure](spikes/0608-zk-selective-disclosure.md)
 
 # Security
 
