@@ -427,3 +427,6 @@ export function finalizeCeremony(
   }));
   return attachSignatures(entry, sigs);
 }
+
+export * from "./passkey.js";
+export * from "./intent.js";
